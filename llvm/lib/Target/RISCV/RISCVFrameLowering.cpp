@@ -93,8 +93,6 @@ static unsigned getSPReg(const RISCVSubtarget &STI) { return RISCV::X2; }
 
 void RISCVFrameLowering::emitPrologue(MachineFunction &MF,
                                       MachineBasicBlock &MBB) const {
-  assert(&MF.front() == &MBB && "Shrink-wrapping not yet supported");
-
   MachineFrameInfo &MFI = MF.getFrameInfo();
   auto *RVFI = MF.getInfo<RISCVMachineFunctionInfo>();
   const RISCVRegisterInfo *RI = STI.getRegisterInfo();
@@ -178,6 +176,9 @@ void RISCVFrameLowering::emitEpilogue(MachineFunction &MF,
   const RISCVInstrInfo *TII = STI.getInstrInfo();
   unsigned FPReg = getFPReg(STI);
   unsigned SPReg = getSPReg(STI);
+
+  if (!MBBI->isTerminator())
+    MBBI = std::next(MBBI);
 
   // If callee-saved registers are saved via libcall, place stack adjustment
   // before this call.
@@ -536,4 +537,48 @@ bool RISCVFrameLowering::restoreCalleeSavedRegisters(
   }
 
   return true;
+}
+
+bool RISCVFrameLowering::canUseAsPrologue(const MachineBasicBlock &MBB) const {
+  MachineBasicBlock *TmpMBB = const_cast<MachineBasicBlock *>(&MBB);
+  auto *RVFI = TmpMBB->getParent()->getInfo<RISCVMachineFunctionInfo>();
+
+  if (!RVFI->getUseSaveRestoreLibCalls())
+    return true;
+
+  // Inserting a call to a __riscv_save libcall requires the use of the register
+  // t0 (X5) to hold the return address. Therefore if this register is already
+  // used we can't insert the call.
+
+  RegScavenger RS;
+  RS.enterBasicBlock(*TmpMBB);
+  return !RS.isRegUsed(RISCV::X5);
+}
+
+bool RISCVFrameLowering::canUseAsEpilogue(const MachineBasicBlock &MBB) const {
+  MachineBasicBlock *TmpMBB = const_cast<MachineBasicBlock *>(&MBB);
+  auto *RVFI = TmpMBB->getParent()->getInfo<RISCVMachineFunctionInfo>();
+
+  if (!RVFI->getUseSaveRestoreLibCalls())
+    return true;
+
+  // Using the __riscv_restore libcalls to restore CSRs requires a tail call.
+  // This means if we still need to continue executing code within this function
+  // the restore cannot take place in this basic block.
+
+  if (TmpMBB->succ_size() > 1)
+    return false;
+
+  MachineBasicBlock *SuccMBB =
+      TmpMBB->succ_empty() ? TmpMBB->getFallThrough() : *TmpMBB->succ_begin();
+
+  // Doing a tail call should be safe if there are no successors, because either
+  // we have a returning block or the end of the block is unreachable, so the
+  // restore will be eliminated regardless.
+  if (!SuccMBB)
+    return true;
+
+  // The successor can only contain a return, since we would effectively be
+  // replacing the successor with our own tail return at the end of our block.
+  return SuccMBB->isReturnBlock() && SuccMBB->size() == 1;
 }
