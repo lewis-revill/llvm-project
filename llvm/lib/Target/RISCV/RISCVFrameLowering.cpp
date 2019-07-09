@@ -110,8 +110,6 @@ getNonLibcallCSI(const std::vector<CalleeSavedInfo> &CSI) {
 
 void RISCVFrameLowering::emitPrologue(MachineFunction &MF,
                                       MachineBasicBlock &MBB) const {
-  assert(&MF.front() == &MBB && "Shrink-wrapping not yet supported");
-
   MachineFrameInfo &MFI = MF.getFrameInfo();
   auto *RVFI = MF.getInfo<RISCVMachineFunctionInfo>();
   const RISCVRegisterInfo *RI = STI.getRegisterInfo();
@@ -217,14 +215,24 @@ void RISCVFrameLowering::emitPrologue(MachineFunction &MF,
 
 void RISCVFrameLowering::emitEpilogue(MachineFunction &MF,
                                       MachineBasicBlock &MBB) const {
-  MachineBasicBlock::iterator MBBI = MBB.getLastNonDebugInstr();
   const RISCVRegisterInfo *RI = STI.getRegisterInfo();
   MachineFrameInfo &MFI = MF.getFrameInfo();
   auto *RVFI = MF.getInfo<RISCVMachineFunctionInfo>();
-  DebugLoc DL = MBBI->getDebugLoc();
   const RISCVInstrInfo *TII = STI.getInstrInfo();
   Register FPReg = getFPReg(STI);
   Register SPReg = getSPReg(STI);
+
+  // Get the insert location for the epilogue. If there were no terminators in
+  // the block, get the last instruction.
+  MachineBasicBlock::iterator MBBI = MBB.getFirstTerminator();
+  if (MBBI == MBB.end())
+    MBBI = MBB.getLastNonDebugInstr();
+  DebugLoc DL = MBBI->getDebugLoc();
+
+  // If this is not a terminator, the actual insert location should be after the
+  // last instruction.
+  if (!MBBI->isTerminator())
+    MBBI = std::next(MBBI);
 
   // If callee-saved registers are saved via libcall, place stack adjustment
   // before this call.
@@ -598,4 +606,48 @@ bool RISCVFrameLowering::restoreCalleeSavedRegisters(
   }
 
   return true;
+}
+
+bool RISCVFrameLowering::canUseAsPrologue(const MachineBasicBlock &MBB) const {
+  MachineBasicBlock *TmpMBB = const_cast<MachineBasicBlock *>(&MBB);
+  const auto *RVFI = MBB.getParent()->getInfo<RISCVMachineFunctionInfo>();
+
+  if (!RVFI->useSaveRestoreLibCalls())
+    return true;
+
+  // Inserting a call to a __riscv_save libcall requires the use of the register
+  // t0 (X5) to hold the return address. Therefore if this register is already
+  // used we can't insert the call.
+
+  RegScavenger RS;
+  RS.enterBasicBlock(*TmpMBB);
+  return !RS.isRegUsed(RISCV::X5);
+}
+
+bool RISCVFrameLowering::canUseAsEpilogue(const MachineBasicBlock &MBB) const {
+  MachineBasicBlock *TmpMBB = const_cast<MachineBasicBlock *>(&MBB);
+  const auto *RVFI = MBB.getParent()->getInfo<RISCVMachineFunctionInfo>();
+
+  if (!RVFI->useSaveRestoreLibCalls())
+    return true;
+
+  // Using the __riscv_restore libcalls to restore CSRs requires a tail call.
+  // This means if we still need to continue executing code within this function
+  // the restore cannot take place in this basic block.
+
+  if (MBB.succ_size() > 1)
+    return false;
+
+  MachineBasicBlock *SuccMBB =
+      MBB.succ_empty() ? TmpMBB->getFallThrough() : *MBB.succ_begin();
+
+  // Doing a tail call should be safe if there are no successors, because either
+  // we have a returning block or the end of the block is unreachable, so the
+  // restore will be eliminated regardless.
+  if (!SuccMBB)
+    return true;
+
+  // The successor can only contain a return, since we would effectively be
+  // replacing the successor with our own tail return at the end of our block.
+  return SuccMBB->isReturnBlock() && SuccMBB->size() == 1;
 }
