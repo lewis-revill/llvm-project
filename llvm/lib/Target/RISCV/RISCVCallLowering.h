@@ -21,6 +21,8 @@
 namespace llvm {
 
 class RISCVTargetLowering;
+class MachineInstrBuilder;
+class MachineIRBuilder;
 
 class RISCVCallLowering : public CallLowering {
 
@@ -35,6 +37,27 @@ public:
 
   bool lowerCall(MachineIRBuilder &MIRBuilder,
                  CallLoweringInfo &Info) const override;
+
+private:
+  bool lowerReturnVal(MachineIRBuilder &MIRBuilder, const Value *Val,
+                      ArrayRef<Register> VRegs, MachineInstrBuilder &Ret) const;
+
+  /// A function of this type is used to perform value split action.
+  using SplitArgTy = std::function<void(ArrayRef<Register>, int)>;
+
+  template <typename T>
+  void setISDArgsForCallingConv(const Function &F, const ArgInfo &OrigArg,
+                                SmallVectorImpl<EVT> &SplitVTs,
+                                SmallVectorImpl<T> &ISDArgs, bool isRet) const;
+
+  void splitToValueTypes(const ArgInfo &OrigArg,
+                         SmallVectorImpl<ArgInfo> &SplitArgs,
+                         SmallVectorImpl<EVT> &SplitVTs, MachineFunction &MF,
+                         SplitArgTy PerformArgSplit) const;
+
+  template <typename T>
+  void updateArgLocInfo(SmallVectorImpl<CCValAssign> &ArgLocs,
+                        const SmallVectorImpl<T> &Arguments) const;
 };
 
 } // end namespace llvm
