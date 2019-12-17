@@ -57,6 +57,40 @@ struct OutgoingValueHandler : public CallLowering::ValueHandler {
   }
 };
 
+struct IncomingValueHandler : public CallLowering::ValueHandler {
+  IncomingValueHandler(MachineIRBuilder &B, MachineRegisterInfo &MRI,
+                       CCAssignFn *AssignFn)
+      : ValueHandler(B, MRI, AssignFn) {}
+
+  bool isIncomingArgumentHandler() const override { return true; }
+
+  Register getStackAddress(uint64_t Size, int64_t Offset,
+                           MachinePointerInfo &MPO) override {
+    llvm_unreachable("not implemented");
+  }
+
+  void assignValueToAddress(Register ValVReg, Register Addr, uint64_t Size,
+                            MachinePointerInfo &MPO, CCValAssign &VA) override {
+    llvm_unreachable("not implemented");
+  }
+
+  void assignValueToReg(Register ValVReg, Register PhysReg,
+                        CCValAssign &VA) override {
+    // Copy argument received in physical register to desired VReg.
+    MIRBuilder.getMBB().addLiveIn(PhysReg);
+    MIRBuilder.buildCopy(ValVReg, PhysReg);
+  }
+
+  bool assignArg(unsigned ValNo, MVT ValVT, MVT LocVT,
+                 CCValAssign::LocInfo LocInfo,
+                 const CallLowering::ArgInfo &Info, ISD::ArgFlagsTy Flags,
+                 CCState &State) override {
+    if (AssignFn)
+      return AssignFn(ValNo, ValVT, LocVT, LocInfo, Flags, State);
+    return false;
+  }
+};
+
 } // namespace
 
 RISCVCallLowering::RISCVCallLowering(const RISCVTargetLowering &TLI)
@@ -122,10 +156,71 @@ bool RISCVCallLowering::lowerFormalArguments(
     MachineIRBuilder &MIRBuilder, const Function &F,
     ArrayRef<ArrayRef<Register>> VRegs) const {
 
+  // Early exit if there are no arguments.
   if (F.arg_empty())
     return true;
 
-  return false;
+  // TODO: Support vararg functions.
+  if (F.isVarArg())
+    return false;
+
+  // TODO: Support all argument types.
+  for (auto &Arg : F.args()) {
+    if (Arg.getType()->isIntegerTy())
+      continue;
+    if (Arg.getType()->isPointerTy())
+      continue;
+    return false;
+  }
+
+  MachineFunction &MF = MIRBuilder.getMF();
+  const DataLayout &DL = MF.getDataLayout();
+  const RISCVTargetLowering &TLI = *getTLI<RISCVTargetLowering>();
+
+  SmallVector<ArgInfo, 32> SplitArgInfos;
+  SmallVector<ISD::InputArg, 8> Ins;
+  unsigned Index = 0;
+  for (auto &Arg : F.args()) {
+    // Construct the ArgInfo object from destination register and argument type.
+    ArgInfo AInfo(VRegs[Index], Arg.getType());
+    setArgFlags(AInfo, Index + AttributeList::FirstArgIndex, DL, F);
+
+    SmallVector<EVT, 4> SplitEVTs;
+    ComputeValueVTs(TLI, DL, Arg.getType(), SplitEVTs);
+    assert(VRegs[Index].size() == SplitEVTs.size() &&
+           "For each split Type there should be exactly one VReg.");
+
+    setISDArgsForCallingConv(F, AInfo, SplitEVTs, Ins, /*isRet=*/false);
+
+    // Handle any required merging from split value types - as indicated in
+    // SplitEVTs - from physical registers into the desired VReg. ArgInfo
+    // objects are constructed correspondingly and appended to SplitArgInfos.
+    splitToValueTypes(AInfo, SplitArgInfos, SplitEVTs, MF,
+                      [&](ArrayRef<Register> Regs, int SplitIdx) {
+                        auto MIB =
+                            MIRBuilder.buildMerge(VRegs[Index][SplitIdx], Regs);
+                        MIRBuilder.setInstr(*MIB.getInstr());
+                      });
+
+    ++Index;
+  }
+
+  SmallVector<CCValAssign, 16> ArgLocs;
+  CCState CCInfo(F.getCallingConv(), F.isVarArg(), MF, ArgLocs, F.getContext());
+
+  // TODO: Access CC_RISCV_FastCC when using CallingConv::Fast. Preferrably
+  // TLI.CCAssignFnForCall will be implemented and the approach for both CCs
+  // will be unified.
+  if (F.getCallingConv() == CallingConv::Fast)
+    return false;
+  TLI.analyzeInputArgs(MF, CCInfo, Ins, /*IsRet=*/false);
+
+  IncomingValueHandler Handler(MIRBuilder, MF.getRegInfo(), nullptr);
+
+  if (!handleAssignments(CCInfo, ArgLocs, MIRBuilder, SplitArgInfos, Handler))
+    return false;
+
+  return true;
 }
 
 bool RISCVCallLowering::lowerCall(MachineIRBuilder &MIRBuilder,
