@@ -91,6 +91,21 @@ struct IncomingValueHandler : public CallLowering::ValueHandler {
   }
 };
 
+struct CallReturnHandler : public IncomingValueHandler {
+  CallReturnHandler(MachineIRBuilder &B, MachineRegisterInfo &MRI,
+                    CCAssignFn *AssignFn, MachineInstrBuilder &MIB)
+      : IncomingValueHandler(B, MRI, AssignFn), MIB(MIB) {}
+
+  MachineInstrBuilder MIB;
+
+  void assignValueToReg(Register ValVReg, Register PhysReg,
+                        CCValAssign &VA) override {
+    // Copy argument received in physical register to desired VReg.
+    MIB.addDef(PhysReg, RegState::Implicit);
+    MIRBuilder.buildCopy(ValVReg, PhysReg);
+  }
+};
+
 } // namespace
 
 RISCVCallLowering::RISCVCallLowering(const RISCVTargetLowering &TLI)
@@ -127,7 +142,8 @@ bool RISCVCallLowering::lowerReturnVal(MachineIRBuilder &MIRBuilder,
                     });
 
   SmallVector<ISD::OutputArg, 8> Outs;
-  setISDArgsForCallingConv(F, OrigRetInfo, SplitEVTs, Outs, true);
+  setISDArgsForCallingConv(F, OrigRetInfo, SplitEVTs, Outs, F.getCallingConv(),
+                           true);
 
   SmallVector<CCValAssign, 16> ArgLocs;
   CCState CCInfo(F.getCallingConv(), F.isVarArg(), MF, ArgLocs, F.getContext());
@@ -190,7 +206,8 @@ bool RISCVCallLowering::lowerFormalArguments(
     assert(VRegs[Index].size() == SplitEVTs.size() &&
            "For each split Type there should be exactly one VReg.");
 
-    setISDArgsForCallingConv(F, AInfo, SplitEVTs, Ins, /*isRet=*/false);
+    setISDArgsForCallingConv(F, AInfo, SplitEVTs, Ins, F.getCallingConv(),
+                             /*isRet=*/false);
 
     // Handle any required merging from split value types - as indicated in
     // SplitEVTs - from physical registers into the desired VReg. ArgInfo
@@ -225,18 +242,127 @@ bool RISCVCallLowering::lowerFormalArguments(
 
 bool RISCVCallLowering::lowerCall(MachineIRBuilder &MIRBuilder,
                                   CallLoweringInfo &Info) const {
-  return false;
+
+  MachineFunction &MF = MIRBuilder.getMF();
+  const Function &F = MF.getFunction();
+  const DataLayout &DL = MF.getDataLayout();
+  const RISCVTargetLowering &TLI = *getTLI<RISCVTargetLowering>();
+
+  // TODO: Support vararg functions.
+  if (Info.IsVarArg)
+    return false;
+
+  // TODO: Support all argument types.
+  for (auto &AInfo : Info.OrigArgs) {
+    if (AInfo.Ty->isIntegerTy())
+      continue;
+    if (AInfo.Ty->isPointerTy())
+      continue;
+    if (AInfo.Ty->isFloatingPointTy())
+      continue;
+    return false;
+  }
+
+  SmallVector<ArgInfo, 32> SplitArgInfos;
+  SmallVector<ISD::OutputArg, 8> Outs;
+  unsigned Index = 0;
+  for (auto &AInfo : Info.OrigArgs) {
+    SmallVector<EVT, 4> SplitEVTs;
+    ComputeValueVTs(TLI, DL, AInfo.Ty, SplitEVTs);
+    assert(AInfo.Regs.size() == SplitEVTs.size() &&
+           "For each split Type there should be exactly one VReg.");
+
+    setISDArgsForCallingConv(F, AInfo, SplitEVTs, Outs, Info.CallConv,
+                             /*isRet=*/false);
+
+    // Handle any required unmerging of split value types - as indicated in
+    // SplitEVTs - from a given VReg into physical registers. ArgInfo objects
+    // are constructed correspondingly and appended to SplitArgInfos.
+    splitToValueTypes(AInfo, SplitArgInfos, SplitEVTs, MF,
+                      [&](ArrayRef<Register> Regs, int SplitIdx) {
+                        MIRBuilder.buildUnmerge(Regs, AInfo.Regs[SplitIdx]);
+                      });
+
+    ++Index;
+  }
+
+  SmallVector<CCValAssign, 16> ArgLocs;
+  CCState CCInfo(Info.CallConv, Info.IsVarArg, MF, ArgLocs, F.getContext());
+
+  // TODO: Access CC_RISCV_FastCC when using CallingConv::Fast. Preferrably
+  // TLI.CCAssignFnForCall will be implemented and the approach for both CCs
+  // will be unified.
+  if (Info.CallConv == CallingConv::Fast)
+    return false;
+  TLI.analyzeOutputArgs(MF, CCInfo, Outs, /*IsRet=*/false, nullptr);
+  updateArgLocInfo(ArgLocs, Outs);
+
+  if (!Info.Callee.isReg())
+    Info.Callee.setTargetFlags(RISCVII::MO_CALL);
+
+  MachineInstrBuilder Call =
+      MIRBuilder
+          .buildInstrNoInsert(Info.Callee.isReg() ? RISCV::PseudoCALLIndirect
+                                                  : RISCV::PseudoCALL)
+          .add(Info.Callee);
+
+  OutgoingValueHandler ArgHandler(MIRBuilder, MF.getRegInfo(), Call, nullptr);
+  if (!handleAssignments(CCInfo, ArgLocs, MIRBuilder, SplitArgInfos,
+                         ArgHandler))
+    return false;
+
+  MIRBuilder.insertInstr(Call);
+
+  if (Info.OrigRet.Ty->isVoidTy())
+    return true;
+
+  // TODO: Only integer, pointer and aggregate types are supported now.
+  if (!Info.OrigRet.Ty->isIntOrPtrTy() && !Info.OrigRet.Ty->isAggregateType())
+    return false;
+
+  SmallVector<EVT, 4> SplitRetEVTs;
+  ComputeValueVTs(TLI, DL, Info.OrigRet.Ty, SplitRetEVTs);
+  assert(Info.OrigRet.Regs.size() == SplitRetEVTs.size() &&
+         "For each split Type there should be exactly one VReg.");
+
+  SmallVector<ArgInfo, 4> SplitRetInfos;
+  splitToValueTypes(Info.OrigRet, SplitRetInfos, SplitRetEVTs, MF,
+                    [&](ArrayRef<Register> Regs, int SplitIdx) {
+                      MIRBuilder.buildMerge(Info.OrigRet.Regs[SplitIdx], Regs);
+                    });
+
+  SmallVector<ISD::InputArg, 8> Ins;
+  setISDArgsForCallingConv(F, Info.OrigRet, SplitRetEVTs, Ins, Info.CallConv,
+                           /*isRet=*/true);
+
+  SmallVector<CCValAssign, 16> RVLocs;
+  CCState RetCCInfo(Info.CallConv, Info.IsVarArg, MF, RVLocs, F.getContext());
+
+  TLI.analyzeInputArgs(MF, RetCCInfo, Ins, /*IsRet=*/true);
+  updateArgLocInfo(RVLocs, Ins);
+
+  // Assignments should be handled *before* the merging of values takes place.
+  // To ensure this, the insert point is temporarily adjusted to just after the
+  // call instruction.
+  MachineBasicBlock::iterator CallInsertPt = Call;
+  MIRBuilder.setInsertPt(MIRBuilder.getMBB(), std::next(CallInsertPt));
+
+  CallReturnHandler Handler(MIRBuilder, MF.getRegInfo(), nullptr, Call);
+  if (!handleAssignments(RetCCInfo, RVLocs, MIRBuilder, SplitRetInfos, Handler))
+    return false;
+
+  // Readjust insert point to end of basic block.
+  MIRBuilder.setMBB(MIRBuilder.getMBB());
+
+  return true;
 }
 
 template <typename T>
-void RISCVCallLowering::setISDArgsForCallingConv(const Function &F,
-                                                 const ArgInfo &OrigArg,
-                                                 SmallVectorImpl<EVT> &SplitVTs,
-                                                 SmallVectorImpl<T> &ISDArgs,
-                                                 bool isRet) const {
+void RISCVCallLowering::setISDArgsForCallingConv(
+    const Function &F, const ArgInfo &OrigArg, SmallVectorImpl<EVT> &SplitVTs,
+    SmallVectorImpl<T> &ISDArgs, CallingConv::ID CC, bool isRet) const {
   const DataLayout &DL = F.getParent()->getDataLayout();
   LLVMContext &Ctx = F.getContext();
-  CallingConv::ID CC = F.getCallingConv();
   const RISCVTargetLowering &TLI = *getTLI<RISCVTargetLowering>();
 
   for (unsigned i = 0, e = SplitVTs.size(); i != e; ++i) {

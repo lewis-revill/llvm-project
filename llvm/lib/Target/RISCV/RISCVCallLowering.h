@@ -48,7 +48,8 @@ private:
   template <typename T>
   void setISDArgsForCallingConv(const Function &F, const ArgInfo &OrigArg,
                                 SmallVectorImpl<EVT> &SplitVTs,
-                                SmallVectorImpl<T> &ISDArgs, bool isRet) const;
+                                SmallVectorImpl<T> &ISDArgs, CallingConv::ID CC,
+                                bool isRet) const;
 
   void splitToValueTypes(const ArgInfo &OrigArg,
                          SmallVectorImpl<ArgInfo> &SplitArgs,
