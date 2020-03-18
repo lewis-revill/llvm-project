@@ -11,6 +11,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "RISCVLegalizerInfo.h"
+#include "RISCVSubtarget.h"
+#include "llvm/CodeGen/GlobalISel/LegalizerHelper.h"
 #include "llvm/CodeGen/TargetOpcodes.h"
 #include "llvm/CodeGen/ValueTypes.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -19,5 +21,210 @@
 using namespace llvm;
 
 RISCVLegalizerInfo::RISCVLegalizerInfo(const RISCVSubtarget &ST) {
+  const LLT s1 = LLT::scalar(1);
+  const LLT s32 = LLT::scalar(32);
+  const LLT s64 = LLT::scalar(64);
+  const LLT s128 = LLT::scalar(128);
+
+  bool IsRV64 = ST.is64Bit();
+  const LLT &XLenLLT = IsRV64 ? s64 : s32;
+
+  using namespace TargetOpcode;
+
+  if (IsRV64) {
+    // Account for availability of single word instructions on RV64.
+
+    getActionDefinitionsBuilder({G_ADD, G_SUB})
+        .customFor({s32})
+        .legalFor({s64})
+        .clampScalar(0, s64, s64);
+
+    getActionDefinitionsBuilder({G_SHL, G_ASHR, G_LSHR})
+        .customFor({{s32, s32}})
+        .legalFor({{s64, s64}})
+        .clampScalar(0, s64, s64)
+        .clampScalar(1, s64, s64);
+
+    if (ST.hasStdExtM()) {
+      getActionDefinitionsBuilder({G_MUL, G_SDIV, G_SREM, G_UDIV, G_UREM})
+          .customFor({s32})
+          .legalFor({s64})
+          .clampScalar(0, s64, s64);
+    } else {
+      getActionDefinitionsBuilder({G_MUL, G_SDIV, G_SREM, G_UDIV, G_UREM})
+        .libcallFor({s64, s128})
+        .clampScalar(0, s64, s128);
+    }
+  } else {
+    getActionDefinitionsBuilder({G_ADD, G_SUB})
+        .legalFor({s32})
+        .clampScalar(0, s32, s32);
+
+    getActionDefinitionsBuilder({G_SHL, G_ASHR, G_LSHR})
+        .legalFor({{s32, s32}})
+        .clampScalar(0, s32, s32)
+        .clampScalar(1, s32, s32);
+
+    if (ST.hasStdExtM()) {
+      getActionDefinitionsBuilder({G_MUL, G_SDIV, G_SREM, G_UDIV, G_UREM})
+          .legalFor({s32})
+          .libcallFor({s128})
+          .clampScalar(0, s32, s32);
+    } else {
+      getActionDefinitionsBuilder({G_MUL, G_SDIV, G_SREM, G_UDIV, G_UREM})
+        .libcallFor({s32, s64, s128})
+        .clampScalar(0, s32, s128);
+    }
+  }
+
+  getActionDefinitionsBuilder({G_AND, G_OR, G_XOR})
+      .legalFor({XLenLLT})
+      .clampScalar(0, XLenLLT, XLenLLT);
+
+  // Split operations on double XLen types.
+  getActionDefinitionsBuilder({G_UADDO, G_UADDE, G_USUBO, G_USUBE})
+      .lowerFor({{XLenLLT, s1}});
+  if (ST.hasStdExtM()) {
+    getActionDefinitionsBuilder(G_UMULO)
+        .lowerFor({{XLenLLT, s1}});
+
+    getActionDefinitionsBuilder(G_UMULH)
+        .legalFor({XLenLLT})
+        .clampScalar(0, XLenLLT, XLenLLT);
+  }
+
+  getActionDefinitionsBuilder(G_ICMP)
+      .legalFor({XLenLLT, XLenLLT})
+      .clampScalar(0, XLenLLT, XLenLLT)
+      .clampScalar(1, XLenLLT, XLenLLT);
+
+  getActionDefinitionsBuilder(G_CONSTANT)
+      .legalFor({XLenLLT})
+      .clampScalar(0, XLenLLT, XLenLLT);
+
+  // G_ZEXT -> G_AND
+  // G_SEXT -> G_SEXT_INREG
+  getActionDefinitionsBuilder({G_ZEXT, G_SEXT, G_ANYEXT})
+      .legalFor({XLenLLT})
+      .clampScalar(0, XLenLLT, XLenLLT)
+      .maxScalar(1, XLenLLT);
+
+  // G_SEXT_INREG -> G_SHL + G_ASHR
+  // TODO: Find a way to selectively avoid lowering extends from 32 bits.
+  getActionDefinitionsBuilder(G_SEXT_INREG).lower();
+
   computeTables();
+}
+
+static unsigned getRISCVWOpcodeWithSExt(unsigned Opcode) {
+  switch (Opcode) {
+  default:
+    llvm_unreachable("Unexpected opcode");
+  case TargetOpcode::G_ADD:
+    return RISCV::ADDW;
+  case TargetOpcode::G_SUB:
+    return RISCV::SUBW;
+  case TargetOpcode::G_MUL:
+    return RISCV::MULW;
+  case TargetOpcode::G_SDIV:
+    return RISCV::DIVW;
+  case TargetOpcode::G_SREM:
+    return RISCV::REMW;
+  }
+}
+
+// TODO: For now this function is identical to legalizeWOp. When a way to
+// preserve G_SEXT_INREG for this pattern only is found, this should be updated.
+bool RISCVLegalizerInfo::legalizeWOpWithSExt(
+    MachineInstr &MI, MachineRegisterInfo &MRI,
+    MachineIRBuilder &MIRBuilder) const {
+  const RISCVSubtarget &ST =
+      static_cast<const RISCVSubtarget &>(MI.getMF()->getSubtarget());
+  const LLT s64 = LLT::scalar(64);
+
+  MIRBuilder.setInstr(MI);
+
+  Register NewOp0 = MRI.createGenericVirtualRegister(s64);
+  MIRBuilder.buildAnyExt({NewOp0}, {MI.getOperand(1).getReg()});
+  Register NewOp1 = MRI.createGenericVirtualRegister(s64);
+  MIRBuilder.buildAnyExt({NewOp1}, {MI.getOperand(2).getReg()});
+
+  Register NewDst = MRI.createGenericVirtualRegister(s64);
+  MIRBuilder
+      .buildInstr(getRISCVWOpcodeWithSExt(MI.getOpcode()), {NewDst},
+                  {NewOp0, NewOp1})
+      .constrainAllUses(MIRBuilder.getTII(), *ST.getRegisterInfo(),
+                        *ST.getRegBankInfo());
+
+  MIRBuilder.setInsertPt(MIRBuilder.getMBB(), ++MIRBuilder.getInsertPt());
+  MIRBuilder.buildTrunc({MI.getOperand(0).getReg()}, {NewDst});
+
+  MI.eraseFromParent();
+  return true;
+}
+
+static unsigned getRISCVWOpcode(unsigned Opcode) {
+  switch (Opcode) {
+  default:
+    llvm_unreachable("Unexpected opcode");
+  case TargetOpcode::G_SHL:
+    return RISCV::SLLW;
+  case TargetOpcode::G_ASHR:
+    return RISCV::SRAW;
+  case TargetOpcode::G_LSHR:
+    return RISCV::SRLW;
+  case TargetOpcode::G_UDIV:
+    return RISCV::DIVUW;
+  case TargetOpcode::G_UREM:
+    return RISCV::REMUW;
+  }
+}
+
+bool RISCVLegalizerInfo::legalizeWOp(MachineInstr &MI, MachineRegisterInfo &MRI,
+                                     MachineIRBuilder &MIRBuilder) const {
+  const RISCVSubtarget &ST =
+      static_cast<const RISCVSubtarget &>(MI.getMF()->getSubtarget());
+  const LLT s64 = LLT::scalar(64);
+
+  MIRBuilder.setInstr(MI);
+
+  Register NewOp0 = MRI.createGenericVirtualRegister(s64);
+  MIRBuilder.buildAnyExt({NewOp0}, {MI.getOperand(1).getReg()});
+  Register NewOp1 = MRI.createGenericVirtualRegister(s64);
+  MIRBuilder.buildAnyExt({NewOp1}, {MI.getOperand(2).getReg()});
+
+  Register NewDst = MRI.createGenericVirtualRegister(s64);
+  MIRBuilder
+      .buildInstr(getRISCVWOpcode(MI.getOpcode()), {NewDst}, {NewOp0, NewOp1})
+      .constrainAllUses(MIRBuilder.getTII(), *ST.getRegisterInfo(),
+                        *ST.getRegBankInfo());
+
+  MIRBuilder.setInsertPt(MIRBuilder.getMBB(), ++MIRBuilder.getInsertPt());
+  MIRBuilder.buildTrunc({MI.getOperand(0).getReg()}, {NewDst});
+
+  MI.eraseFromParent();
+  return true;
+}
+
+bool RISCVLegalizerInfo::legalizeCustom(MachineInstr &MI,
+                                        MachineRegisterInfo &MRI,
+                                        MachineIRBuilder &MIRBuilder,
+                                        GISelChangeObserver &Observer) const {
+  switch (MI.getOpcode()) {
+  case TargetOpcode::G_ADD:
+  case TargetOpcode::G_SUB:
+  case TargetOpcode::G_MUL:
+  case TargetOpcode::G_SDIV:
+  case TargetOpcode::G_SREM:
+    return legalizeWOpWithSExt(MI, MRI, MIRBuilder);
+  case TargetOpcode::G_SHL:
+  case TargetOpcode::G_ASHR:
+  case TargetOpcode::G_LSHR:
+  case TargetOpcode::G_UDIV:
+  case TargetOpcode::G_UREM:
+    return legalizeWOp(MI, MRI, MIRBuilder);
+  default:
+    return false;
+  }
+  return true;
 }

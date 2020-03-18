@@ -23,6 +23,16 @@ class RISCVSubtarget;
 class RISCVLegalizerInfo : public LegalizerInfo {
 public:
   RISCVLegalizerInfo(const RISCVSubtarget &ST);
+
+  bool legalizeCustom(MachineInstr &MI, MachineRegisterInfo &MRI,
+                      MachineIRBuilder &MIRBuilder,
+                      GISelChangeObserver &Observer) const override;
+
+private:
+  bool legalizeWOp(MachineInstr &MI, MachineRegisterInfo &MRI,
+                   MachineIRBuilder &MIRBuilder) const;
+  bool legalizeWOpWithSExt(MachineInstr &MI, MachineRegisterInfo &MRI,
+                           MachineIRBuilder &MIRBuilder) const;
 };
 } // end namespace llvm
 #endif
