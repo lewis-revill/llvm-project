@@ -14,8 +14,10 @@
 #include "RISCVRegisterBankInfo.h"
 #include "RISCVSubtarget.h"
 #include "RISCVTargetMachine.h"
+#include "Utils/RISCVMatInt.h"
 #include "llvm/CodeGen/GlobalISel/InstructionSelector.h"
 #include "llvm/CodeGen/GlobalISel/InstructionSelectorImpl.h"
+#include "llvm/CodeGen/GlobalISel/MachineIRBuilder.h"
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "riscv-isel"
@@ -39,6 +41,11 @@ public:
 
 private:
   bool selectImpl(MachineInstr &I, CodeGenCoverage &CoverageInfo) const;
+  bool isRegInGprBank(Register Reg, const MachineRegisterInfo &MRI) const;
+  const TargetRegisterClass *getRegClass(Register Reg,
+                                         const MachineRegisterInfo &MRI) const;
+  bool selectCopy(MachineInstr &I, MachineRegisterInfo &MRI) const;
+  bool selectConstant(MachineInstr &I, MachineRegisterInfo &MRI) const;
 
   const RISCVSubtarget &STI;
   const RISCVInstrInfo &TII;
@@ -80,17 +87,104 @@ RISCVInstructionSelector::RISCVInstructionSelector(
 {
 }
 
+bool RISCVInstructionSelector::isRegInGprBank(
+    Register Reg, const MachineRegisterInfo &MRI) const {
+  return RBI.getRegBank(Reg, MRI, TRI)->getID() == RISCV::GPRRegBankID;
+}
+
+const TargetRegisterClass *
+RISCVInstructionSelector::getRegClass(Register Reg,
+                                      const MachineRegisterInfo &MRI) const {
+  const LLT Ty = MRI.getType(Reg);
+  const unsigned Size = Ty.getSizeInBits();
+
+  if (isRegInGprBank(Reg, MRI)) {
+    assert((Ty.isScalar() || Ty.isPointer()) &&
+           Size == (STI.is64Bit() ? 64 : 32) &&
+           "Register class not available for LLT, register bank combination");
+    return &RISCV::GPRRegClass;
+  }
+
+  llvm_unreachable("Unsupported register bank.");
+}
+bool RISCVInstructionSelector::selectCopy(MachineInstr &I,
+                                          MachineRegisterInfo &MRI) const {
+  Register DstReg = I.getOperand(0).getReg();
+
+  if (Register::isPhysicalRegister(DstReg))
+    return true;
+
+  const TargetRegisterClass *RC = getRegClass(DstReg, MRI);
+  if (!RBI.constrainGenericRegister(DstReg, *RC, MRI)) {
+    LLVM_DEBUG(dbgs() << "Failed to constrain " << TII.getName(I.getOpcode())
+                      << " operand\n");
+    return false;
+  }
+
+  return true;
+}
+
+bool RISCVInstructionSelector::selectConstant(MachineInstr &I,
+                                              MachineRegisterInfo &MRI) const {
+  Register DstReg = I.getOperand(0).getReg();
+  int64_t Val = I.getOperand(1).getCImm()->getSExtValue();
+  MachineIRBuilder MIRBuilder(I);
+
+  RISCVMatInt::InstSeq Seq;
+  RISCVMatInt::generateInstSeq(Val, STI.is64Bit(), Seq);
+
+  // Source is X0 when used in the first instruction of the sequence.
+  Register SrcReg = RISCV::X0;
+  Register TmpReg;
+  for (RISCVMatInt::Inst &Inst : Seq) {
+    TmpReg = MRI.createVirtualRegister(&RISCV::GPRRegClass);
+
+    MachineInstr *CurMI =
+        (Inst.Opc == RISCV::LUI
+             ? MIRBuilder.buildInstr(RISCV::LUI, {TmpReg}, {})
+             : MIRBuilder.buildInstr(Inst.Opc, {TmpReg}, {SrcReg}))
+            .addImm(Inst.Imm);
+
+    if (!constrainSelectedInstRegOperands(*CurMI, TII, TRI, RBI))
+      return false;
+
+    SrcReg = TmpReg;
+  }
+
+  MIRBuilder.buildCopy({DstReg}, {TmpReg});
+  if (!RBI.constrainGenericRegister(DstReg, RISCV::GPRRegClass, MRI))
+    return false;
+
+  return true;
+}
+
 bool RISCVInstructionSelector::select(MachineInstr &I) {
+  MachineBasicBlock &MBB = *I.getParent();
+  MachineFunction &MF = *MBB.getParent();
+  MachineRegisterInfo &MRI = MF.getRegInfo();
 
   if (!isPreISelGenericOpcode(I.getOpcode())) {
     // Certain non-generic instructions also need some special handling.
+    if (I.isCopy())
+      return selectCopy(I, MRI);
+
     return true;
   }
 
   if (selectImpl(I, *CoverageInfo))
     return true;
 
-  return false;
+  switch (I.getOpcode()) {
+  case TargetOpcode::G_CONSTANT:
+    if (!selectConstant(I, MRI))
+      return false;
+
+    break;
+  default:
+    return false;
+  }
+  I.eraseFromParent();
+  return true;
 }
 
 namespace llvm {
