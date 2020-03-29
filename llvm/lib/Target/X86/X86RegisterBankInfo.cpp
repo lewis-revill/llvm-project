@@ -37,7 +37,7 @@ X86RegisterBankInfo::X86RegisterBankInfo(const TargetRegisterInfo &TRI)
   // GR64 + its subclasses.
   assert(RBGPR.covers(*TRI.getRegClass(X86::GR64RegClassID)) &&
          "Subclass not added?");
-  assert(RBGPR.getSize() == 64 && "GPRs should hold up to 64-bit");
+  assert(getSize(&RBGPR) == 64 && "GPRs should hold up to 64-bit");
 }
 
 const RegisterBank &

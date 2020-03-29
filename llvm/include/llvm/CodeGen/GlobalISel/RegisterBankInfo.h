@@ -83,7 +83,7 @@ public:
     /// \note This method does not check anything when assertions are disabled.
     ///
     /// \return True is the check was successful.
-    bool verify() const;
+    bool verify(const RegisterBankInfo &RBI) const;
   };
 
   /// Helper struct that represents how a value is mapped through
@@ -174,7 +174,7 @@ public:
     /// \note This method does not check anything when assertions are disabled.
     ///
     /// \return True is the check was successful.
-    bool verify(unsigned MeaningfulBitWidth) const;
+    bool verify(const RegisterBankInfo &RBI, unsigned MeaningfulBitWidth) const;
 
     /// Print this on dbgs() stream.
     void dump() const;
@@ -384,10 +384,16 @@ public:
 
 protected:
   /// Hold the set of supported register banks.
-  RegisterBank **RegBanks;
+  const RegisterBank **RegBanks;
 
   /// Total number of register banks.
   unsigned NumRegBanks;
+
+  /// Hold the sizes of the register banks for all HwModes.
+  const unsigned *Sizes;
+
+  /// Current HwMode for the target.
+  unsigned HwMode;
 
   /// Keep dynamically allocated PartialMapping in a separate map.
   /// This shouldn't be needed when everything gets TableGen'ed.
@@ -415,7 +421,8 @@ protected:
 
   /// Create a RegisterBankInfo that can accommodate up to \p NumRegBanks
   /// RegisterBank instances.
-  RegisterBankInfo(RegisterBank **RegBanks, unsigned NumRegBanks);
+  RegisterBankInfo(const RegisterBank **RegBanks, unsigned NumRegBanks,
+                   const unsigned *Sizes, unsigned HwMode);
 
   /// This constructor is meaningless.
   /// It just provides a default constructor that can be used at link time
@@ -428,7 +435,7 @@ protected:
   }
 
   /// Get the register bank identified by \p ID.
-  RegisterBank &getRegBank(unsigned ID) {
+  const RegisterBank &getRegBank(unsigned ID) {
     assert(ID < getNumRegBanks() && "Accessing an unknown register bank");
     return *RegBanks[ID];
   }
@@ -574,6 +581,15 @@ public:
   /// Get the register bank identified by \p ID.
   const RegisterBank &getRegBank(unsigned ID) const {
     return const_cast<RegisterBankInfo *>(this)->getRegBank(ID);
+  }
+
+  /// Get the maximal size in bits that fits in the given register bank.
+  unsigned getSize(const RegisterBank *RegBank) const {
+    for (size_t Index = 0; Index < NumRegBanks; ++Index)
+      if (RegBanks[Index] == RegBank)
+        return Sizes[Index + HwMode * NumRegBanks];
+
+    assert(false && "Could not get size for unknown register bank");
   }
 
   /// Get the register bank of \p Reg.
