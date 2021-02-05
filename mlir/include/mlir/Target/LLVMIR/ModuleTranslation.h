@@ -15,13 +15,16 @@
 #define MLIR_TARGET_LLVMIR_MODULETRANSLATION_H
 
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/Transforms/LegalizeForExport.h"
 #include "mlir/IR/Block.h"
 #include "mlir/IR/Module.h"
 #include "mlir/IR/Value.h"
 
+#include "llvm/Frontend/OpenMP/OMPIRBuilder.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/MatrixBuilder.h"
 #include "llvm/IR/Value.h"
 
 namespace mlir {
@@ -54,6 +57,8 @@ public:
     auto llvmModule = prepareLLVMModule(m);
     if (!llvmModule)
       return nullptr;
+
+    LLVM::ensureDistinctSuccessors(m);
 
     T translator(m, std::move(llvmModule));
     if (failed(translator.convertGlobals()))
@@ -102,6 +107,11 @@ private:
 
   /// A converter for translating debug information.
   std::unique_ptr<detail::DebugTranslation> debugTranslation;
+
+  /// Builder for LLVM IR generation of OpenMP constructs.
+  std::unique_ptr<llvm::OpenMPIRBuilder> ompBuilder;
+  /// Precomputed pointer to OpenMP dialect.
+  const Dialect *ompDialect;
 
   /// Mappings between llvm.mlir.global definitions and corresponding globals.
   DenseMap<Operation *, llvm::GlobalValue *> globalsMapping;

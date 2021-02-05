@@ -313,14 +313,14 @@ namespace {
 struct SimplifyAllocConst : public OpRewritePattern<AllocOp> {
   using OpRewritePattern<AllocOp>::OpRewritePattern;
 
-  PatternMatchResult matchAndRewrite(AllocOp alloc,
-                                     PatternRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(AllocOp alloc,
+                                PatternRewriter &rewriter) const override {
     // Check to see if any dimensions operands are constants.  If so, we can
     // substitute and drop them.
     if (llvm::none_of(alloc.getOperands(), [](Value operand) {
           return matchPattern(operand, m_ConstantIndex());
         }))
-      return matchFailure();
+      return failure();
 
     auto memrefType = alloc.getType();
 
@@ -364,7 +364,7 @@ struct SimplifyAllocConst : public OpRewritePattern<AllocOp> {
                                                     alloc.getType());
 
     rewriter.replaceOp(alloc, {resultCast});
-    return matchSuccess();
+    return success();
   }
 };
 
@@ -373,13 +373,13 @@ struct SimplifyAllocConst : public OpRewritePattern<AllocOp> {
 struct SimplifyDeadAlloc : public OpRewritePattern<AllocOp> {
   using OpRewritePattern<AllocOp>::OpRewritePattern;
 
-  PatternMatchResult matchAndRewrite(AllocOp alloc,
-                                     PatternRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(AllocOp alloc,
+                                PatternRewriter &rewriter) const override {
     if (alloc.use_empty()) {
       rewriter.eraseOp(alloc);
-      return matchSuccess();
+      return success();
     }
-    return matchFailure();
+    return failure();
   }
 };
 } // end anonymous namespace.
@@ -461,34 +461,41 @@ namespace {
 struct SimplifyBrToBlockWithSinglePred : public OpRewritePattern<BranchOp> {
   using OpRewritePattern<BranchOp>::OpRewritePattern;
 
-  PatternMatchResult matchAndRewrite(BranchOp op,
-                                     PatternRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(BranchOp op,
+                                PatternRewriter &rewriter) const override {
     // Check that the successor block has a single predecessor.
     Block *succ = op.getDest();
     Block *opParent = op.getOperation()->getBlock();
     if (succ == opParent || !has_single_element(succ->getPredecessors()))
-      return matchFailure();
+      return failure();
 
     // Merge the successor into the current block and erase the branch.
     rewriter.mergeBlocks(succ, opParent, op.getOperands());
     rewriter.eraseOp(op);
-    return matchSuccess();
+    return success();
   }
 };
 } // end anonymous namespace.
 
-Block *BranchOp::getDest() { return getSuccessor(0); }
+Block *BranchOp::getDest() { return getSuccessor(); }
 
-void BranchOp::setDest(Block *block) { return setSuccessor(block, 0); }
+void BranchOp::setDest(Block *block) { return setSuccessor(block); }
 
 void BranchOp::eraseOperand(unsigned index) {
-  getOperation()->eraseSuccessorOperand(0, index);
+  getOperation()->eraseOperand(index);
 }
 
 void BranchOp::getCanonicalizationPatterns(OwningRewritePatternList &results,
                                            MLIRContext *context) {
   results.insert<SimplifyBrToBlockWithSinglePred>(context);
 }
+
+Optional<OperandRange> BranchOp::getSuccessorOperands(unsigned index) {
+  assert(index == 0 && "invalid successor index");
+  return getOperands();
+}
+
+bool BranchOp::canEraseSuccessorOperand() { return true; }
 
 //===----------------------------------------------------------------------===//
 // CallOp
@@ -538,18 +545,18 @@ struct SimplifyIndirectCallWithKnownCallee
     : public OpRewritePattern<CallIndirectOp> {
   using OpRewritePattern<CallIndirectOp>::OpRewritePattern;
 
-  PatternMatchResult matchAndRewrite(CallIndirectOp indirectCall,
-                                     PatternRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(CallIndirectOp indirectCall,
+                                PatternRewriter &rewriter) const override {
     // Check that the callee is a constant callee.
     SymbolRefAttr calledFn;
     if (!matchPattern(indirectCall.getCallee(), m_Constant(&calledFn)))
-      return matchFailure();
+      return failure();
 
     // Replace with a direct call.
     rewriter.replaceOpWithNewOp<CallOp>(indirectCall, calledFn,
                                         indirectCall.getResultTypes(),
                                         indirectCall.getArgOperands());
-    return matchSuccess();
+    return success();
   }
 };
 } // end anonymous namespace.
@@ -695,9 +702,8 @@ static bool applyCmpPredicate(CmpFPredicate predicate, const APFloat &lhs,
     return cmpResult == APFloat::cmpUnordered;
   case CmpFPredicate::AlwaysTrue:
     return true;
-  default:
-    llvm_unreachable("unknown comparison predicate");
   }
+  llvm_unreachable("unknown comparison predicate");
 }
 
 // Constant folding hook for comparisons.
@@ -727,20 +733,20 @@ namespace {
 struct SimplifyConstCondBranchPred : public OpRewritePattern<CondBranchOp> {
   using OpRewritePattern<CondBranchOp>::OpRewritePattern;
 
-  PatternMatchResult matchAndRewrite(CondBranchOp condbr,
-                                     PatternRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(CondBranchOp condbr,
+                                PatternRewriter &rewriter) const override {
     if (matchPattern(condbr.getCondition(), m_NonZero())) {
       // True branch taken.
       rewriter.replaceOpWithNewOp<BranchOp>(condbr, condbr.getTrueDest(),
                                             condbr.getTrueOperands());
-      return matchSuccess();
+      return success();
     } else if (matchPattern(condbr.getCondition(), m_Zero())) {
       // False branch taken.
       rewriter.replaceOpWithNewOp<BranchOp>(condbr, condbr.getFalseDest(),
                                             condbr.getFalseOperands());
-      return matchSuccess();
+      return success();
     }
-    return matchFailure();
+    return failure();
   }
 };
 } // end anonymous namespace.
@@ -749,6 +755,13 @@ void CondBranchOp::getCanonicalizationPatterns(
     OwningRewritePatternList &results, MLIRContext *context) {
   results.insert<SimplifyConstCondBranchPred>(context);
 }
+
+Optional<OperandRange> CondBranchOp::getSuccessorOperands(unsigned index) {
+  assert(index < getNumSuccessors() && "invalid successor index");
+  return index == trueIndex ? getTrueOperands() : getFalseOperands();
+}
+
+bool CondBranchOp::canEraseSuccessorOperand() { return true; }
 
 //===----------------------------------------------------------------------===//
 // Constant*Op
@@ -945,21 +958,21 @@ namespace {
 struct SimplifyDeadDealloc : public OpRewritePattern<DeallocOp> {
   using OpRewritePattern<DeallocOp>::OpRewritePattern;
 
-  PatternMatchResult matchAndRewrite(DeallocOp dealloc,
-                                     PatternRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(DeallocOp dealloc,
+                                PatternRewriter &rewriter) const override {
     // Check that the memref operand's defining operation is an AllocOp.
     Value memref = dealloc.memref();
     if (!isa_and_nonnull<AllocOp>(memref.getDefiningOp()))
-      return matchFailure();
+      return failure();
 
     // Check that all of the uses of the AllocOp are other DeallocOps.
     for (auto *user : memref.getUsers())
       if (!isa<DeallocOp>(user))
-        return matchFailure();
+        return failure();
 
     // Erase the dealloc operation.
     rewriter.eraseOp(dealloc);
-    return matchSuccess();
+    return success();
   }
 };
 } // end anonymous namespace.
@@ -1812,10 +1825,7 @@ void mlir::SubViewOp::build(Builder *b, OperationState &result, Value source,
                             ArrayRef<NamedAttribute> attrs) {
   if (!resultType)
     resultType = inferSubViewResultType(source.getType().cast<MemRefType>());
-  auto segmentAttr = b->getI32VectorAttr(
-      {1, static_cast<int>(offsets.size()), static_cast<int32_t>(sizes.size()),
-       static_cast<int32_t>(strides.size())});
-  build(b, result, resultType, source, offsets, sizes, strides, segmentAttr);
+  build(b, result, resultType, source, offsets, sizes, strides);
   result.addAttributes(attrs);
 }
 
@@ -1823,48 +1833,6 @@ void mlir::SubViewOp::build(Builder *b, OperationState &result, Type resultType,
                             Value source) {
   build(b, result, source, /*offsets=*/{}, /*sizes=*/{}, /*strides=*/{},
         resultType);
-}
-
-static ParseResult parseSubViewOp(OpAsmParser &parser, OperationState &result) {
-  OpAsmParser::OperandType srcInfo;
-  SmallVector<OpAsmParser::OperandType, 4> offsetsInfo;
-  SmallVector<OpAsmParser::OperandType, 4> sizesInfo;
-  SmallVector<OpAsmParser::OperandType, 4> stridesInfo;
-  auto indexType = parser.getBuilder().getIndexType();
-  Type srcType, dstType;
-  if (parser.parseOperand(srcInfo) ||
-      parser.parseOperandList(offsetsInfo, OpAsmParser::Delimiter::Square) ||
-      parser.parseOperandList(sizesInfo, OpAsmParser::Delimiter::Square) ||
-      parser.parseOperandList(stridesInfo, OpAsmParser::Delimiter::Square)) {
-    return failure();
-  }
-
-  auto builder = parser.getBuilder();
-  result.addAttribute(
-      SubViewOp::getOperandSegmentSizeAttr(),
-      builder.getI32VectorAttr({1, static_cast<int>(offsetsInfo.size()),
-                                static_cast<int32_t>(sizesInfo.size()),
-                                static_cast<int32_t>(stridesInfo.size())}));
-
-  return failure(
-      parser.parseOptionalAttrDict(result.attributes) ||
-      parser.parseColonType(srcType) ||
-      parser.resolveOperand(srcInfo, srcType, result.operands) ||
-      parser.resolveOperands(offsetsInfo, indexType, result.operands) ||
-      parser.resolveOperands(sizesInfo, indexType, result.operands) ||
-      parser.resolveOperands(stridesInfo, indexType, result.operands) ||
-      parser.parseKeywordType("to", dstType) ||
-      parser.addTypeToList(dstType, result.types));
-}
-
-static void print(OpAsmPrinter &p, SubViewOp op) {
-  p << op.getOperationName() << ' ' << op.getOperand(0) << '[' << op.offsets()
-    << "][" << op.sizes() << "][" << op.strides() << ']';
-
-  std::array<StringRef, 1> elidedAttrs = {
-      SubViewOp::getOperandSegmentSizeAttr()};
-  p.printOptionalAttrDict(op.getAttrs(), elidedAttrs);
-  p << " : " << op.getOperand(0).getType() << " to " << op.getType();
 }
 
 static LogicalResult verify(SubViewOp op) {
@@ -2035,8 +2003,8 @@ class SubViewOpShapeFolder final : public OpRewritePattern<SubViewOp> {
 public:
   using OpRewritePattern<SubViewOp>::OpRewritePattern;
 
-  PatternMatchResult matchAndRewrite(SubViewOp subViewOp,
-                                     PatternRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(SubViewOp subViewOp,
+                                PatternRewriter &rewriter) const override {
     MemRefType subViewType = subViewOp.getType();
     // Follow all or nothing approach for shapes for now. If all the operands
     // for sizes are constants then fold it into the type of the result memref.
@@ -2044,7 +2012,7 @@ public:
         llvm::any_of(subViewOp.sizes(), [](Value operand) {
           return !matchPattern(operand, m_ConstantIndex());
         })) {
-      return matchFailure();
+      return failure();
     }
     SmallVector<int64_t, 4> staticShape(subViewOp.getNumSizes());
     for (auto size : llvm::enumerate(subViewOp.sizes())) {
@@ -2060,7 +2028,7 @@ public:
     // Insert a memref_cast for compatibility of the uses of the op.
     rewriter.replaceOpWithNewOp<MemRefCastOp>(subViewOp, newSubViewOp,
                                               subViewOp.getType());
-    return matchSuccess();
+    return success();
   }
 };
 
@@ -2069,10 +2037,10 @@ class SubViewOpStrideFolder final : public OpRewritePattern<SubViewOp> {
 public:
   using OpRewritePattern<SubViewOp>::OpRewritePattern;
 
-  PatternMatchResult matchAndRewrite(SubViewOp subViewOp,
-                                     PatternRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(SubViewOp subViewOp,
+                                PatternRewriter &rewriter) const override {
     if (subViewOp.getNumStrides() == 0) {
-      return matchFailure();
+      return failure();
     }
     // Follow all or nothing approach for strides for now. If all the operands
     // for strides are constants then fold it into the strides of the result
@@ -2088,7 +2056,7 @@ public:
         llvm::any_of(subViewOp.strides(), [](Value stride) {
           return !matchPattern(stride, m_ConstantIndex());
         })) {
-      return matchFailure();
+      return failure();
     }
 
     SmallVector<int64_t, 4> staticStrides(subViewOp.getNumStrides());
@@ -2109,7 +2077,7 @@ public:
     // Insert a memref_cast for compatibility of the uses of the op.
     rewriter.replaceOpWithNewOp<MemRefCastOp>(subViewOp, newSubViewOp,
                                               subViewOp.getType());
-    return matchSuccess();
+    return success();
   }
 };
 
@@ -2118,10 +2086,10 @@ class SubViewOpOffsetFolder final : public OpRewritePattern<SubViewOp> {
 public:
   using OpRewritePattern<SubViewOp>::OpRewritePattern;
 
-  PatternMatchResult matchAndRewrite(SubViewOp subViewOp,
-                                     PatternRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(SubViewOp subViewOp,
+                                PatternRewriter &rewriter) const override {
     if (subViewOp.getNumOffsets() == 0) {
-      return matchFailure();
+      return failure();
     }
     // Follow all or nothing approach for offsets for now. If all the operands
     // for offsets are constants then fold it into the offset of the result
@@ -2138,7 +2106,7 @@ public:
         llvm::any_of(subViewOp.offsets(), [](Value stride) {
           return !matchPattern(stride, m_ConstantIndex());
         })) {
-      return matchFailure();
+      return failure();
     }
 
     auto staticOffset = baseOffset;
@@ -2160,7 +2128,7 @@ public:
     // Insert a memref_cast for compatibility of the uses of the op.
     rewriter.replaceOpWithNewOp<MemRefCastOp>(subViewOp, newSubViewOp,
                                               subViewOp.getType());
-    return matchSuccess();
+    return success();
   }
 };
 
@@ -2379,18 +2347,18 @@ namespace {
 struct ViewOpShapeFolder : public OpRewritePattern<ViewOp> {
   using OpRewritePattern<ViewOp>::OpRewritePattern;
 
-  PatternMatchResult matchAndRewrite(ViewOp viewOp,
-                                     PatternRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(ViewOp viewOp,
+                                PatternRewriter &rewriter) const override {
     // Return if none of the operands are constants.
     if (llvm::none_of(viewOp.getOperands(), [](Value operand) {
           return matchPattern(operand, m_ConstantIndex());
         }))
-      return matchFailure();
+      return failure();
 
     // Get result memref type.
     auto memrefType = viewOp.getType();
     if (memrefType.getAffineMaps().size() > 1)
-      return matchFailure();
+      return failure();
     auto map = memrefType.getAffineMaps().empty()
                    ? AffineMap::getMultiDimIdentityMap(memrefType.getRank(),
                                                        rewriter.getContext())
@@ -2400,7 +2368,7 @@ struct ViewOpShapeFolder : public OpRewritePattern<ViewOp> {
     int64_t oldOffset;
     SmallVector<int64_t, 4> oldStrides;
     if (failed(getStridesAndOffset(memrefType, oldStrides, oldOffset)))
-      return matchFailure();
+      return failure();
 
     SmallVector<Value, 4> newOperands;
 
@@ -2476,27 +2444,27 @@ struct ViewOpShapeFolder : public OpRewritePattern<ViewOp> {
     // Insert a cast so we have the same type as the old memref type.
     rewriter.replaceOpWithNewOp<MemRefCastOp>(viewOp, newViewOp,
                                               viewOp.getType());
-    return matchSuccess();
+    return success();
   }
 };
 
 struct ViewOpMemrefCastFolder : public OpRewritePattern<ViewOp> {
   using OpRewritePattern<ViewOp>::OpRewritePattern;
 
-  PatternMatchResult matchAndRewrite(ViewOp viewOp,
-                                     PatternRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(ViewOp viewOp,
+                                PatternRewriter &rewriter) const override {
     Value memrefOperand = viewOp.getOperand(0);
     MemRefCastOp memrefCastOp =
         dyn_cast_or_null<MemRefCastOp>(memrefOperand.getDefiningOp());
     if (!memrefCastOp)
-      return matchFailure();
+      return failure();
     Value allocOperand = memrefCastOp.getOperand();
     AllocOp allocOp = dyn_cast_or_null<AllocOp>(allocOperand.getDefiningOp());
     if (!allocOp)
-      return matchFailure();
+      return failure();
     rewriter.replaceOpWithNewOp<ViewOp>(viewOp, viewOp.getType(), allocOperand,
                                         viewOp.operands());
-    return matchSuccess();
+    return success();
   }
 };
 

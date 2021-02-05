@@ -7,13 +7,13 @@
 
 # RUN: llvm-mc -filetype=obj -triple=mips-unknown-linux %s -o %t-be.o
 # RUN: ld.lld -shared %t-be.o -script %t.script -o %t-be.so
-# RUN: llvm-objdump -t -s %t-be.so | FileCheck -check-prefixes=SYM,BE %s
+# RUN: llvm-objdump -t -s %t-be.so | FileCheck --check-prefixes=SYM,BE %s
 # RUN: llvm-readelf -r -s --dynamic-table -A %t-be.so \
 # RUN:   | FileCheck -check-prefix=REL %s
 
 # RUN: llvm-mc -filetype=obj -triple=mipsel-unknown-linux %s -o %t-el.o
 # RUN: ld.lld -shared %t-el.o -script %t.script -o %t-el.so
-# RUN: llvm-objdump -t -s %t-el.so | FileCheck -check-prefixes=SYM,EL %s
+# RUN: llvm-objdump -t -s %t-el.so | FileCheck --check-prefixes=SYM,EL %s
 # RUN: llvm-readelf --dynamic-table -r -s -A %t-el.so \
 # RUN:   | FileCheck -check-prefix=REL %s
 
@@ -25,7 +25,7 @@ v2:
   .word v1   # R_MIPS_32 target v1 addend 0
 
 # SYM: SYMBOL TABLE:
-# SYM: 00011000  .data  00000000 v1
+# SYM: 00011000 l .data  00000000 v1
 
 # BE: Contents of section .data:
 # BE-NEXT: {{.*}} 00000004 00011000

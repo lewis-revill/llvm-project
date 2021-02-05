@@ -2,7 +2,7 @@
 # RUN: llvm-readobj -a %t.o | FileCheck %s --check-prefix LLVM-ALL
 # RUN: llvm-readobj --all %t.o | FileCheck %s --check-prefix LLVM-ALL
 
-# LLVM-ALL: Format: ELF32-i386
+# LLVM-ALL: Format: elf32-i386
 # LLVM-ALL: Arch: i386
 # LLVM-ALL: AddressSize: 32bit
 # LLVM-ALL: LoadName:
@@ -36,7 +36,7 @@
 # GNU-ALL: Version needs section '.gnu.version_r' contains {{.*}} entries:
 # GNU-ALL: There are no section groups in this file.
 # GNU-ALL: Histogram for bucket list length (total of 1 buckets)
-# GNU-ALL: Displaying notes found at file offset {{.*}} with length {{.*}}:
+# GNU-ALL: Displaying notes found
 
 --- !ELF
 FileHeader:

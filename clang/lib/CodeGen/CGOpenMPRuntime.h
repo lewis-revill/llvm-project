@@ -855,6 +855,14 @@ private:
                                         StringRef UniqueDeclName, LValue LVal,
                                         SourceLocation Loc);
 
+  /// Returns the number of the elements and the address of the depobj
+  /// dependency array.
+  /// \return Number of elements in depobj array and the pointer to the array of
+  /// dependencies.
+  std::pair<llvm::Value *, LValue> getDepobjElements(CodeGenFunction &CGF,
+                                                     LValue DepobjLVal,
+                                                     SourceLocation Loc);
+
 public:
   explicit CGOpenMPRuntime(CodeGenModule &CGM)
       : CGOpenMPRuntime(CGM, ".", ".") {}
@@ -1782,7 +1790,7 @@ public:
   /// \param ForDepobj true if the memory for depencies is alloacted for depobj
   /// directive. In this case, the variable is allocated in dynamically.
   /// \returns Pointer to the first element of the array casted to VoidPtr type.
-  Address emitDependClause(
+  std::pair<llvm::Value *, Address> emitDependClause(
       CodeGenFunction &CGF,
       ArrayRef<std::pair<OpenMPDependClauseKind, const Expr *>> Dependencies,
       bool ForDepobj, SourceLocation Loc);
@@ -1791,6 +1799,12 @@ public:
   /// directive.
   void emitDestroyClause(CodeGenFunction &CGF, LValue DepobjLVal,
                          SourceLocation Loc);
+
+  /// Updates the dependency kind in the specified depobj object.
+  /// \param DepobjLVal LValue for the main depobj object.
+  /// \param NewDepKind New dependency kind.
+  void emitUpdateClause(CodeGenFunction &CGF, LValue DepobjLVal,
+                        OpenMPDependClauseKind NewDepKind, SourceLocation Loc);
 };
 
 /// Class supports emissionof SIMD-only code.

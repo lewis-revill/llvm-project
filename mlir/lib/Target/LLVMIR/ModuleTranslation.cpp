@@ -15,12 +15,14 @@
 
 #include "DebugTranslation.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/OpenMP/OpenMPDialect.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Module.h"
 #include "mlir/IR/StandardTypes.h"
 #include "mlir/Support/LLVM.h"
 
 #include "llvm/ADT/SetVector.h"
+#include "llvm/Frontend/OpenMP/OMPIRBuilder.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -92,6 +94,8 @@ llvm::Constant *ModuleTranslation::getLLVMConstant(llvm::Type *llvmType,
   }
   if (auto intAttr = attr.dyn_cast<IntegerAttr>())
     return llvm::ConstantInt::get(llvmType, intAttr.getValue());
+  if (auto boolAttr = attr.dyn_cast<BoolAttr>())
+    return llvm::ConstantInt::get(llvmType, boolAttr.getValue());
   if (auto floatAttr = attr.dyn_cast<FloatAttr>())
     return llvm::ConstantFP::get(llvmType, floatAttr.getValue());
   if (auto funcAttr = attr.dyn_cast<FlatSymbolRefAttr>())
@@ -111,7 +115,8 @@ llvm::Constant *ModuleTranslation::getLLVMConstant(llvm::Type *llvmType,
     if (!child)
       return nullptr;
     if (llvmType->isVectorTy())
-      return llvm::ConstantVector::getSplat(numElements, child);
+      return llvm::ConstantVector::getSplat(
+          llvm::ElementCount(numElements, /*Scalable=*/false), child);
     if (llvmType->isArrayTy()) {
       auto arrayType = llvm::ArrayType::get(elementType, numElements);
       SmallVector<llvm::Constant *, 8> constants(numElements, child);
@@ -271,7 +276,9 @@ ModuleTranslation::ModuleTranslation(Operation *module,
                                      std::unique_ptr<llvm::Module> llvmModule)
     : mlirModule(module), llvmModule(std::move(llvmModule)),
       debugTranslation(
-          std::make_unique<DebugTranslation>(module, *this->llvmModule)) {
+          std::make_unique<DebugTranslation>(module, *this->llvmModule)),
+      ompDialect(
+          module->getContext()->getRegisteredDialect<omp::OpenMPDialect>()) {
   assert(satisfiesLLVMModule(mlirModule) &&
          "mlirModule should honor LLVM's module semantics.");
 }
@@ -352,7 +359,7 @@ LogicalResult ModuleTranslation::convertOperation(Operation &opInst,
   // Emit branches.  We need to look up the remapped blocks and ignore the block
   // arguments that were transformed into PHI nodes.
   if (auto brOp = dyn_cast<LLVM::BrOp>(opInst)) {
-    builder.CreateBr(blockMapping[brOp.getSuccessor(0)]);
+    builder.CreateBr(blockMapping[brOp.getSuccessor()]);
     return success();
   }
   if (auto condbrOp = dyn_cast<LLVM::CondBrOp>(opInst)) {
@@ -372,6 +379,20 @@ LogicalResult ModuleTranslation::convertOperation(Operation &opInst,
 
     valueMapping[addressOfOp.getResult()] = globalsMapping.lookup(global);
     return success();
+  }
+
+  if (opInst.getDialect() == ompDialect) {
+    if (!ompBuilder) {
+      ompBuilder = std::make_unique<llvm::OpenMPIRBuilder>(*llvmModule);
+      ompBuilder->initialize();
+    }
+
+    if (isa<omp::BarrierOp>(opInst)) {
+      ompBuilder->CreateBarrier(builder.saveIP(), llvm::omp::OMPD_barrier);
+      return success();
+    }
+    return opInst.emitError("unsupported OpenMP operation: ")
+           << opInst.getName();
   }
 
   return opInst.emitError("unsupported or non-LLVM operation: ")
@@ -483,8 +504,8 @@ static Value getPHISourceValue(Block *current, Block *pred,
          "different blocks");
 
   return condBranchOp.getSuccessor(0) == current
-             ? terminator.getSuccessorOperand(0, index)
-             : terminator.getSuccessorOperand(1, index);
+             ? condBranchOp.trueDestOperands()[index]
+             : condBranchOp.falseDestOperands()[index];
 }
 
 void ModuleTranslation::connectPHINodes(LLVMFuncOp func) {

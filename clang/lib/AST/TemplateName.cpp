@@ -14,7 +14,7 @@
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclBase.h"
 #include "clang/AST/DeclTemplate.h"
-#include "clang/AST/DependencyFlags.h"
+#include "clang/AST/DependenceFlags.h"
 #include "clang/AST/NestedNameSpecifier.h"
 #include "clang/AST/PrettyPrinter.h"
 #include "clang/AST/TemplateBase.h"
@@ -185,7 +185,7 @@ TemplateNameDependence TemplateName::getDependence() const {
     D |= TemplateNameDependence::UnexpandedPack;
     break;
   case TemplateName::NameKind::OverloadedTemplate:
-    assert(false && "overloaded templates shouldn't survive to here.");
+    llvm_unreachable("overloaded templates shouldn't survive to here.");
   default:
     break;
   }

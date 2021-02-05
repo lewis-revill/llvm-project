@@ -212,6 +212,14 @@ public:
     return T.isNull();
   }
 
+  /// Transform a template parameter depth level.
+  ///
+  /// During a transformation that transforms template parameters, this maps
+  /// an old template parameter depth to a new depth.
+  unsigned TransformTemplateDepth(unsigned Depth) {
+    return Depth;
+  }
+
   /// Determine whether the given call argument should be dropped, e.g.,
   /// because it is a default argument.
   ///
@@ -1942,6 +1950,16 @@ public:
     return getSema().ActOnOpenMPHintClause(Hint, StartLoc, LParenLoc, EndLoc);
   }
 
+  /// Build a new OpenMP 'detach' clause.
+  ///
+  /// By default, performs semantic analysis to build the new statement.
+  /// Subclasses may override this routine to provide different behavior.
+  OMPClause *RebuildOMPDetachClause(Expr *Evt, SourceLocation StartLoc,
+                                    SourceLocation LParenLoc,
+                                    SourceLocation EndLoc) {
+    return getSema().ActOnOpenMPDetachClause(Evt, StartLoc, LParenLoc, EndLoc);
+  }
+
   /// Build a new OpenMP 'dist_schedule' clause.
   ///
   /// By default, performs semantic analysis to build the new OpenMP clause.
@@ -2550,8 +2568,9 @@ public:
   /// By default, performs semantic analysis to build the new expression.
   /// Subclasses may override this routine to provide different behavior.
   ExprResult RebuildStmtExpr(SourceLocation LParenLoc, Stmt *SubStmt,
-                             SourceLocation RParenLoc, bool IsDependent) {
-    return getSema().BuildStmtExpr(LParenLoc, SubStmt, RParenLoc, IsDependent);
+                             SourceLocation RParenLoc, unsigned TemplateDepth) {
+    return getSema().BuildStmtExpr(LParenLoc, SubStmt, RParenLoc,
+                                   TemplateDepth);
   }
 
   /// Build a new __builtin_choose_expr expression.
@@ -8772,6 +8791,19 @@ TreeTransform<Derived>::TransformOMPOrderedClause(OMPOrderedClause *C) {
 
 template <typename Derived>
 OMPClause *
+TreeTransform<Derived>::TransformOMPDetachClause(OMPDetachClause *C) {
+  ExprResult E;
+  if (Expr *Evt = C->getEventHandler()) {
+    E = getDerived().TransformExpr(Evt);
+    if (E.isInvalid())
+      return nullptr;
+  }
+  return getDerived().RebuildOMPDetachClause(E.get(), C->getBeginLoc(),
+                                             C->getLParenLoc(), C->getEndLoc());
+}
+
+template <typename Derived>
+OMPClause *
 TreeTransform<Derived>::TransformOMPNowaitClause(OMPNowaitClause *C) {
   // No need to rebuild this clause, no template-dependent parameters.
   return C;
@@ -10432,12 +10464,10 @@ TreeTransform<Derived>::TransformStmtExpr(StmtExpr *E) {
     return ExprError();
   }
 
-  // FIXME: This is not correct when substituting inside a templated
-  // context that isn't a DeclContext (such as a variable template).
-  bool IsDependent = getSema().CurContext->isDependentContext();
+  unsigned OldDepth = E->getTemplateDepth();
+  unsigned NewDepth = getDerived().TransformTemplateDepth(OldDepth);
 
-  if (!getDerived().AlwaysRebuild() &&
-      IsDependent == E->isInstantiationDependent() &&
+  if (!getDerived().AlwaysRebuild() && OldDepth == NewDepth &&
       SubStmt.get() == E->getSubStmt()) {
     // Calling this an 'error' is unintuitive, but it does the right thing.
     SemaRef.ActOnStmtExprError();
@@ -10445,7 +10475,7 @@ TreeTransform<Derived>::TransformStmtExpr(StmtExpr *E) {
   }
 
   return getDerived().RebuildStmtExpr(E->getLParenLoc(), SubStmt.get(),
-                                      E->getRParenLoc(), IsDependent);
+                                      E->getRParenLoc(), NewDepth);
 }
 
 template<typename Derived>
@@ -11383,7 +11413,7 @@ TreeTransform<Derived>::TransformRequiresExpr(RequiresExpr *E) {
       SemaRef, Sema::ExpressionEvaluationContext::Unevaluated);
 
   RequiresExprBodyDecl *Body = RequiresExprBodyDecl::Create(
-      getSema().Context, E->getBody()->getDeclContext(),
+      getSema().Context, getSema().CurContext,
       E->getBody()->getBeginLoc());
 
   Sema::ContextRAII SavedContext(getSema(), Body, /*NewThisContext*/false);

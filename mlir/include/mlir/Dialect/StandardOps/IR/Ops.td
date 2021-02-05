@@ -13,17 +13,20 @@
 #ifndef STANDARD_OPS
 #define STANDARD_OPS
 
-include "mlir/Analysis/CallInterfaces.td"
 include "mlir/IR/OpAsmInterface.td"
+include "mlir/Interfaces/CallInterfaces.td"
+include "mlir/Interfaces/ControlFlowInterfaces.td"
+include "mlir/Interfaces/SideEffects.td"
 
-def Std_Dialect : Dialect {
+def StandardOps_Dialect : Dialect {
   let name = "std";
   let cppNamespace = "";
+  let hasConstantMaterializer = 1;
 }
 
 // Base class for Standard dialect ops.
 class Std_Op<string mnemonic, list<OpTrait> traits = []> :
-    Op<Std_Dialect, mnemonic, traits> {
+    Op<StandardOps_Dialect, mnemonic, traits> {
   // For every standard op, there needs to be a:
   //   * void print(OpAsmPrinter &p, ${C++ class of Op} op)
   //   * LogicalResult verify(${C++ class of Op} op)
@@ -61,7 +64,7 @@ class CastOp<string mnemonic, list<OpTrait> traits = []> :
 // Base class for unary ops. Requires single operand and result. Individual
 // classes will have `operand` accessor.
 class UnaryOp<string mnemonic, list<OpTrait> traits = []> :
-    Op<Std_Dialect, mnemonic, !listconcat(traits, [NoSideEffect])> {
+    Op<StandardOps_Dialect, mnemonic, !listconcat(traits, [NoSideEffect])> {
   let results = (outs AnyType);
   let printer = [{
     return printStandardUnaryOp(this->getOperation(), p);
@@ -84,7 +87,7 @@ class FloatUnaryOp<string mnemonic, list<OpTrait> traits = []> :
 // results to be of the same type, but does not constrain them to specific
 // types.  Individual classes will have `lhs` and `rhs` accessor to operands.
 class ArithmeticOp<string mnemonic, list<OpTrait> traits = []> :
-    Op<Std_Dialect, mnemonic,
+    Op<StandardOps_Dialect, mnemonic,
        !listconcat(traits, [NoSideEffect, SameOperandsAndResultType])> {
 
   let results = (outs AnyType);
@@ -331,7 +334,8 @@ def AtomicRMWOp : Std_Op<"atomic_rmw", [
 // BranchOp
 //===----------------------------------------------------------------------===//
 
-def BranchOp : Std_Op<"br", [Terminator]> {
+def BranchOp : Std_Op<"br",
+    [DeclareOpInterfaceMethods<BranchOpInterface>, NoSideEffect, Terminator]> {
   let summary = "branch operation";
   let description = [{
     The "br" operation represents a branch operation in a function.
@@ -345,10 +349,13 @@ def BranchOp : Std_Op<"br", [Terminator]> {
       ^bb3(%3: tensor<*xf32>):
   }];
 
+  let arguments = (ins Variadic<AnyType>:$destOperands);
   let successors = (successor AnySuccessor:$dest);
 
-  let builders = [OpBuilder<"Builder *, OperationState &result, Block *dest", [{
-    result.addSuccessor(dest, llvm::None);
+  let builders = [OpBuilder<"Builder *, OperationState &result, Block *dest, "
+                            "ValueRange destOperands = {}", [{
+    result.addSuccessors(dest);
+    result.addOperands(destOperands);
   }]>];
 
   // BranchOp is fully verified by traits.
@@ -363,7 +370,9 @@ def BranchOp : Std_Op<"br", [Terminator]> {
   }];
 
   let hasCanonicalizer = 1;
-  let assemblyFormat = "$dest attr-dict";
+  let assemblyFormat = [{
+    $dest (`(` $destOperands^ `:` type($destOperands) `)`)? attr-dict
+  }];
 }
 
 //===----------------------------------------------------------------------===//
@@ -668,7 +677,9 @@ def CmpIOp : Std_Op<"cmpi",
 // CondBranchOp
 //===----------------------------------------------------------------------===//
 
-def CondBranchOp : Std_Op<"cond_br", [Terminator]> {
+def CondBranchOp : Std_Op<"cond_br",
+    [AttrSizedOperandSegments, DeclareOpInterfaceMethods<BranchOpInterface>,
+     NoSideEffect, Terminator]> {
   let summary = "conditional branch operation";
   let description = [{
     The "cond_br" operation represents a conditional branch operation in a
@@ -685,8 +696,23 @@ def CondBranchOp : Std_Op<"cond_br", [Terminator]> {
          ...
   }];
 
-  let arguments = (ins I1:$condition);
+  let arguments = (ins I1:$condition,
+                       Variadic<AnyType>:$trueDestOperands,
+                       Variadic<AnyType>:$falseDestOperands);
   let successors = (successor AnySuccessor:$trueDest, AnySuccessor:$falseDest);
+
+  let builders = [OpBuilder<
+    "Builder *builder, OperationState &result, Value condition,"
+    "Block *trueDest, ValueRange trueOperands,"
+    "Block *falseDest, ValueRange falseOperands", [{
+      build(builder, result, condition, trueOperands, falseOperands, trueDest,
+            falseDest);
+  }]>, OpBuilder<
+    "Builder *builder, OperationState &result, Value condition,"
+    "Block *trueDest, Block *falseDest, ValueRange falseOperands = {}", [{
+      build(builder, result, condition, trueDest, ValueRange(), falseDest,
+            falseOperands);
+  }]>];
 
   // CondBranchOp is fully verified by traits.
   let verifier = ?;
@@ -719,23 +745,13 @@ def CondBranchOp : Std_Op<"cond_br", [Terminator]> {
       setOperand(getTrueDestOperandIndex() + idx, value);
     }
 
-    operand_iterator true_operand_begin() {
-      return operand_begin() + getTrueDestOperandIndex();
-    }
-    operand_iterator true_operand_end() {
-      return true_operand_begin() + getNumTrueOperands();
-    }
-    operand_range getTrueOperands() {
-      return {true_operand_begin(), true_operand_end()};
-    }
+    operand_range getTrueOperands() { return trueDestOperands(); }
 
-    unsigned getNumTrueOperands()  {
-      return getNumSuccessorOperands(trueIndex);
-    }
+    unsigned getNumTrueOperands()  { return getTrueOperands().size(); }
 
     /// Erase the operand at 'index' from the true operand list.
     void eraseTrueOperand(unsigned index)  {
-      getOperation()->eraseSuccessorOperand(trueIndex, index);
+      eraseSuccessorOperand(trueIndex, index);
     }
 
     // Accessors for operands to the 'false' destination.
@@ -748,21 +764,13 @@ def CondBranchOp : Std_Op<"cond_br", [Terminator]> {
       setOperand(getFalseDestOperandIndex() + idx, value);
     }
 
-    operand_iterator false_operand_begin() { return true_operand_end(); }
-    operand_iterator false_operand_end() {
-      return false_operand_begin() + getNumFalseOperands();
-    }
-    operand_range getFalseOperands() {
-      return {false_operand_begin(), false_operand_end()};
-    }
+    operand_range getFalseOperands() { return falseDestOperands(); }
 
-    unsigned getNumFalseOperands() {
-      return getNumSuccessorOperands(falseIndex);
-    }
+    unsigned getNumFalseOperands() { return getFalseOperands().size(); }
 
     /// Erase the operand at 'index' from the false operand list.
     void eraseFalseOperand(unsigned index) {
-      getOperation()->eraseSuccessorOperand(falseIndex, index);
+      eraseSuccessorOperand(falseIndex, index);
     }
 
   private:
@@ -776,7 +784,12 @@ def CondBranchOp : Std_Op<"cond_br", [Terminator]> {
   }];
 
   let hasCanonicalizer = 1;
-  let assemblyFormat = "$condition `,` successors attr-dict";
+  let assemblyFormat = [{
+    $condition `,`
+    $trueDest (`(` $trueDestOperands^ `:` type($trueDestOperands) `)`)? `,`
+    $falseDest (`(` $falseDestOperands^ `:` type($falseDestOperands) `)`)?
+    attr-dict
+  }];
 }
 
 //===----------------------------------------------------------------------===//
@@ -784,7 +797,7 @@ def CondBranchOp : Std_Op<"cond_br", [Terminator]> {
 //===----------------------------------------------------------------------===//
 
 def ConstantOp : Std_Op<"constant",
-    [NoSideEffect, DeclareOpInterfaceMethods<OpAsmOpInterface>]> {
+    [ConstantLike, NoSideEffect, DeclareOpInterfaceMethods<OpAsmOpInterface>]> {
   let summary = "constant";
 
   let arguments = (ins AnyAttr:$value);
@@ -1041,7 +1054,9 @@ def LoadOp : Std_Op<"load",
       %3 = load %0[%1, %1] : memref<4x4xi32>
   }];
 
-  let arguments = (ins AnyMemRef:$memref, Variadic<Index>:$indices);
+  let arguments = (ins Arg<AnyMemRef, "the reference to load from",
+                           [MemRead]>:$memref,
+                       Variadic<Index>:$indices);
   let results = (outs AnyType:$result);
 
   let builders = [OpBuilder<
@@ -1274,7 +1289,8 @@ def RemFOp : FloatArithmeticOp<"remf"> {
 // ReturnOp
 //===----------------------------------------------------------------------===//
 
-def ReturnOp : Std_Op<"return", [Terminator, HasParent<"FuncOp">]> {
+def ReturnOp : Std_Op<"return", [NoSideEffect, HasParent<"FuncOp">,
+                                 Terminator]> {
   let summary = "return operation";
   let description = [{
     The "return" operation represents a return operation within a function.
@@ -1552,8 +1568,10 @@ def StoreOp : Std_Op<"store",
       store %v, %A[%i, %j] : memref<4x128xf32, (d0, d1) -> (d0, d1), 0>
   }];
 
-  let arguments = (ins AnyType:$value, AnyMemRef:$memref,
-                   Variadic<Index>:$indices);
+  let arguments = (ins AnyType:$value,
+                       Arg<AnyMemRef, "the reference to store to",
+                           [MemWrite]>:$memref,
+                       Variadic<Index>:$indices);
 
   let builders = [OpBuilder<
     "Builder *, OperationState &result, Value valueToStore, Value memref", [{
@@ -1710,16 +1728,18 @@ def SubViewOp : Std_Op<"subview", [AttrSizedOperandSegments, NoSideEffect]> {
     }
   }];
 
-  // TODO(b/144779634, ravishankarm) : Use different arguments for
-  // offsets, sizes and strides.
   let arguments = (ins
     AnyMemRef:$source,
     Variadic<Index>:$offsets,
     Variadic<Index>:$sizes,
-    Variadic<Index>:$strides,
-    I32ElementsAttr:$operand_segment_sizes
+    Variadic<Index>:$strides
   );
-  let results = (outs AnyMemRef);
+  let results = (outs AnyMemRef:$result);
+
+  let assemblyFormat = [{
+    $source `[` $offsets `]` `[` $sizes `]` `[` $strides `]` attr-dict `:`
+    type($source) `to` type($result)
+  }];
 
   let builders = [
     OpBuilder<
@@ -1833,7 +1853,8 @@ def TensorLoadOp : Std_Op<"tensor_load",
        %12 = tensor_load %10 : memref<4x?xf32, #layout, memspace0>
   }];
 
-  let arguments = (ins AnyMemRef:$memref);
+  let arguments = (ins Arg<AnyMemRef, "the reference to load from",
+                           [MemRead]>:$memref);
   let results = (outs AnyTensor:$result);
   // TensorLoadOp is fully verified by traits.
   let verifier = ?;
@@ -1877,7 +1898,9 @@ def TensorStoreOp : Std_Op<"tensor_store",
        tensor_store %8, %10 : memref<4x?xf32, #layout, memspace0>
   }];
 
-  let arguments = (ins AnyTensor:$tensor, AnyMemRef:$memref);
+  let arguments = (ins AnyTensor:$tensor,
+                       Arg<AnyMemRef, "the reference to store to",
+                           [MemWrite]>:$memref);
   // TensorStoreOp is fully verified by traits.
   let verifier = ?;
 

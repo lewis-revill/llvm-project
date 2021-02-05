@@ -3,7 +3,7 @@
 
 # RUN: llvm-mc -filetype=obj -triple=mips64-unknown-linux %s -o %t.o
 # RUN: ld.lld -shared %t.o -o %t.so
-# RUN: llvm-objdump -s -t %t.so | FileCheck -check-prefix=SYM %s
+# RUN: llvm-objdump -s -t %t.so | FileCheck --check-prefix=SYM %s
 # RUN: llvm-readelf --dynamic-table -r -s -A %t.so | FileCheck %s
 
   .data
@@ -14,7 +14,7 @@ v2:
   .quad v1   # R_MIPS_64 target v1 addend 0
 
 # SYM: SYMBOL TABLE:
-# SYM: 00000000[[V1:[0-9a-f]+]]  .data  0000000000000000 v1
+# SYM: 00000000[[V1:[0-9a-f]+]] l .data  0000000000000000 v1
 
 # SYM: Contents of section .data:
 # SYM-NEXT:  {{.*}} 00000000 00000008 00000000 [[V1]]

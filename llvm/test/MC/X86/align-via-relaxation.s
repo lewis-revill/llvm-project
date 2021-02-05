@@ -1,5 +1,7 @@
-# RUN: llvm-mc -mcpu=skylake -filetype=obj -triple x86_64-pc-linux-gnu %s | llvm-objdump -d --section=.text - | FileCheck %s
+# RUN: llvm-mc -mcpu=skylake -filetype=obj -triple x86_64-pc-linux-gnu -x86-pad-max-prefix-size=0 %s | llvm-objdump -d --section=.text - | FileCheck %s
 
+# This test exercises only the padding via relaxation logic.  The  interaction
+# etween prefix padding and relaxation logic can be seen in align-via-padding.s
 
   .file "test.c"
   .text
@@ -30,10 +32,9 @@ foo:
 
   # Check that we're not shifting aroudn the offsets of labels - doing
   # that would require a further round of relaxation
-  # CHECK: bar:
+  # CHECK: <bar>:
   # CHECK: 22: eb fe                          jmp -2 <bar>
-  # CHECK: 24: 66 2e 0f 1f 84 00 00 00 00 00  nopw %cs:(%rax,%rax)
-  # CHECK: 2e: 66 90                          nop
+  # CHECK: 24: 66 66 66 2e 0f 1f 84 00 00 00 00 00 nopw %cs:(%rax,%rax)
   # CHECK: 30: 0f 0b                          ud2
 
 bar:  
@@ -45,18 +46,18 @@ nobypass:
 
   # Canonical toy loop to show benefit - we can align the loop header with
   # fewer nops by relaxing the branch, even though we don't need to
-  # CHECK: loop_preheader:
+  # CHECK: <loop_preheader>:
   # CHECK: 45: 48 85 c0                       testq %rax, %rax
   # CHECK: 48: 0f 8e 22 00 00 00              jle 34 <loop_exit>
-  # CHECK: 4e: 66 2e 0f 1f 84 00 00 00 00 00  nopw %cs:(%rax,%rax)
-  # CHECK: 58: 0f 1f 84 00 00 00 00 00        nopl (%rax,%rax)
-  # CHECK: loop_header:
+  # CHECK: 4e: 66 66 66 66 66 66 2e 0f 1f 84 00 00 00 00 00 nopw %cs:(%rax,%rax)
+  # CHECK: 5d: 0f 1f 00                       nopl (%rax)
+  # CHECK: <loop_header>:
   # CHECK: 60: 48 83 e8 01                    subq $1, %rax
   # CHECK: 64: 48 85 c0                       testq %rax, %rax
   # CHECK: 67: 7e 07                          jle 7 <loop_exit>
   # CHECK: 69: e9 f2 ff ff ff                 jmp -14 <loop_header>
   # CHECK: 6e: 66 90                          nop
-  # CHECK: loop_exit:
+  # CHECK: <loop_exit>:
   # CHECK: 70: c3                             retq
   .p2align 5
   .skip 5
