@@ -136,6 +136,28 @@ static cl::opt<bool> ConsiderLocalIntervalCost(
              "candidate when choosing the best split candidate."),
     cl::init(false));
 
+static cl::opt<unsigned> SplitStageWeight("split-stage-weight", cl::Hidden,
+                                          cl::init(0));
+static cl::opt<unsigned> MemoryStageWeight("memory-stage-weight", cl::Hidden,
+                                           cl::init(0));
+static cl::opt<unsigned> AssignStageWeight("assign-stage-weight", cl::Hidden,
+                                           cl::init(1u << 31));
+
+static cl::opt<unsigned> PreferenceWeight("preference-weight", cl::Hidden,
+                                          cl::init(1u << 30));
+static cl::opt<unsigned> NoPreferenceWeight("no-preference-weight", cl::Hidden,
+                                            cl::init(0));
+
+static cl::opt<unsigned> LocalWeight("local-weight", cl::Hidden, cl::init(0));
+static cl::opt<unsigned> GlobalWeight("global-weight", cl::Hidden,
+                                      cl::init(1u << 29));
+
+static cl::opt<unsigned> SizeWeight("size-weight", cl::Hidden, cl::init(1));
+static cl::opt<unsigned> RCPriorityWeight("rc-priority-weight", cl::Hidden,
+                                          cl::init(1u << 24));
+static cl::opt<unsigned> MemOpsWeight("mem-ops-weight", cl::Hidden,
+                                      cl::init(1));
+
 static RegisterRegAlloc greedyRegAlloc("greedy", "greedy register allocator",
                                        createGreedyRegisterAllocator);
 
@@ -448,6 +470,8 @@ private:
   bool LRE_CanEraseVirtReg(Register) override;
   void LRE_WillShrinkVirtReg(Register) override;
   void LRE_DidCloneVirtReg(Register, Register) override;
+  unsigned getPriority(LiveRangeStage RS, bool IsLocal, bool IsPreferred,
+                       unsigned Size, unsigned RCPriority, unsigned MemOps);
   void enqueue(PQueue &CurQueue, LiveInterval *LI);
   LiveInterval *dequeue(PQueue &CurQueue);
 
@@ -683,67 +707,89 @@ void RAGreedy::releaseMemory() {
   GlobalCand.clear();
 }
 
+unsigned RAGreedy::getPriority(LiveRangeStage RS, bool IsLocal,
+                               bool IsPreferred, unsigned Size,
+                               unsigned RCPriority, unsigned MemOps) {
+  unsigned Prio = 0;
+
+  // Apply weightings according to the stage of allocation we're dealing with.
+  if (RS == RS_Memory)
+    Prio += MemoryStageWeight;
+  else if (RS == RS_Split)
+    Prio += SplitStageWeight;
+  else
+    Prio += AssignStageWeight;
+
+  // Apply local/global weights.
+  Prio += IsLocal ? LocalWeight : GlobalWeight;
+  // Apply preference/no preference weights.
+  Prio += IsPreferred ? PreferenceWeight : NoPreferenceWeight;
+
+  // Add priority weightings according to size, register class priority, and
+  // number of memory operands seen.
+  Prio += SizeWeight * Size;
+  Prio += RCPriorityWeight * RCPriority;
+  Prio += MemOpsWeight * MemOps;
+
+  return Prio;
+}
+
 void RAGreedy::enqueue(LiveInterval *LI) { enqueue(Queue, LI); }
 
 void RAGreedy::enqueue(PQueue &CurQueue, LiveInterval *LI) {
-  // Prioritize live ranges by size, assigning larger ranges first.
-  // The queue holds (size, reg) pairs.
-  const unsigned Size = LI->getSize();
+  // The queue holds (priority, reg) pairs.
+
   const Register Reg = LI->reg();
   assert(Reg.isVirtual() && "Can only enqueue virtual registers");
-  unsigned Prio;
 
   ExtraRegInfo.grow(Reg);
   if (ExtraRegInfo[Reg].Stage == RS_New)
     ExtraRegInfo[Reg].Stage = RS_Assign;
 
-  if (ExtraRegInfo[Reg].Stage == RS_Split) {
-    // Unsplit ranges that couldn't be allocated immediately are deferred until
-    // everything else has been allocated.
-    Prio = Size;
-  } else if (ExtraRegInfo[Reg].Stage == RS_Memory) {
-    // Memory operand should be considered last.
-    // Change the priority such that Memory operand are assigned in
-    // the reverse order that they came in.
-    // TODO: Make this a member variable and probably do something about hints.
-    static unsigned MemOp = 0;
-    Prio = MemOp++;
-  } else {
-    // Giant live ranges fall back to the global assignment heuristic, which
-    // prevents excessive spilling in pathological cases.
+  bool IsLocal = false;
+  bool IsPreferred = false;
+  unsigned Size = LI->getSize();
+  unsigned RCPriority = 0;
+  unsigned MemOps = 0;
+
+  if (ExtraRegInfo[Reg].Stage == RS_Memory) {
+    Size = 0;
+
+    // Track the number of memory operands seen so far, allowing prioritization
+    // according to the order that they came in.
+    static unsigned MemOpsSeen = 0;
+    MemOps = MemOpsSeen++;
+  } else if (ExtraRegInfo[Reg].Stage != RS_Split) {
     bool ReverseLocal = TRI->reverseLocalAssignment();
     const TargetRegisterClass &RC = *MRI->getRegClass(Reg);
+
+    // Giant live ranges fall back to being categorized as global ranges, to
+    // prevent excess spilling in pathological cases.
     bool ForceGlobal = !ReverseLocal &&
       (Size / SlotIndex::InstrDist) > (2 * RC.getNumRegs());
 
     if (ExtraRegInfo[Reg].Stage == RS_Assign && !ForceGlobal && !LI->empty() &&
         LIS->intervalIsInOneMBB(*LI)) {
-      // Allocate original local ranges in linear instruction order. Since they
-      // are singly defined, this produces optimal coloring in the absence of
-      // global interference and other constraints.
-      if (!ReverseLocal)
-        Prio = LI->beginIndex().getInstrDistance(Indexes->getLastIndex());
-      else {
-        // Allocating bottom up may allow many short LRGs to be assigned first
-        // to one of the cheap registers. This could be much faster for very
-        // large blocks on targets with many physical registers.
-        Prio = Indexes->getZeroIndex().getInstrDistance(LI->endIndex());
-      }
-      Prio |= RC.AllocationPriority << 24;
-    } else {
-      // Allocate global and split ranges in long->short order. Long ranges that
-      // don't fit should be spilled (or split) ASAP so they don't create
-      // interference.  Mark a bit to prioritize global above local ranges.
-      Prio = (1u << 29) + Size;
+      IsLocal = true;
+      // To prioritize allocation of the first local ranges encountered, the
+      // size calculation spans from the first point of encountering this range
+      // to the final point encountered by the allocation algorithm. This
+      // calculation therefore takes into account the direction in which the
+      // allocation algorithm operates.
+      Size = ReverseLocal
+                 ? Indexes->getZeroIndex().getInstrDistance(LI->endIndex())
+                 : LI->beginIndex().getInstrDistance(Indexes->getLastIndex());
+      RCPriority = RC.AllocationPriority;
     }
-    // Mark a higher bit to prioritize global and local above RS_Split.
-    Prio |= (1u << 31);
 
-    // Boost ranges that have a physical register hint.
     if (VRM->hasKnownPreference(Reg))
-      Prio |= (1u << 30);
+      IsPreferred = true;
   }
-  // The virtual register number is a tie breaker for same-sized ranges.
+
+  unsigned Prio = getPriority(ExtraRegInfo[Reg].Stage, IsLocal, IsPreferred,
+                              Size, RCPriority, MemOps);
+
+  // The virtual register number is a tie breaker for equal priority ranges.
   // Give lower vreg numbers higher priority to assign them first.
   CurQueue.push(std::make_pair(Prio, ~Reg));
 }
